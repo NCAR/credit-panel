@@ -13,7 +13,7 @@
 }
 
 .plot-grid {
-  background: blue;
+  background: transparent;
   display: grid !important;
   /*overflow-x: auto !important;*/
 

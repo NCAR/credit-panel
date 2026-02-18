@@ -14,6 +14,7 @@ class DatasetBrowser(param.Parameterized):
     def __init__(self, datasets, **params):
         super().__init__(**params)
         self.datasets = datasets
+        print(self.datasets)
         # Storage for row objects to allow dynamic style updates
         self._rows = {}
 
@@ -27,7 +28,9 @@ class DatasetBrowser(param.Parameterized):
             'align-items': 'center',
             'width': '100%',
             'border-radius': '0 4px 4px 0',
-            'transition': 'background 0.2s' # Smooth color transition
+            'transition': 'background 0.2s', # Smooth color transition
+            'padding' : '0px 2px',
+            'margin' : '0pz'
         }
 
     def _set_active(self, name):
@@ -39,8 +42,8 @@ class DatasetBrowser(param.Parameterized):
         # 1. Checkbox for multi-select
         # align='center' and specific margins ensure vertical centering with text
         cb = pn.widgets.Checkbox(
-            name="", value=False, width=30, 
-            align='center', margin=(5, 0, 5, 12) 
+            name="", value=False, width=10, 
+            align='center', margin=(10, 0, 2, 0) 
         )
         
         def update_checked(event):
@@ -69,10 +72,12 @@ class DatasetBrowser(param.Parameterized):
                     box-shadow: none !important;
                     text-align: left !important;
                     padding-left: 5px !important;
-                    line-height: 30px !important;
+                    line-height: 6px !important;
                     font-size: 14px !important;
                     color: #333 !important;
                     cursor: pointer;
+                    outline: none !important;
+                    box-shadow: none !important;
                 }
                 .bk-btn:hover { 
                     background: rgba(0,0,0,0.05) !important; 
@@ -115,30 +120,30 @@ class DatasetBrowser(param.Parameterized):
 
 # --- App Construction ---
 
-# Simulated Dataset Names
-dataset_names = [
-    "2026-02-18T00:00Z_Control",
-    "2026-02-18T06:00Z_Control",
-    "2026-02-18T12:00Z_Exp_v1",
-    "2026-02-18T18:00Z_Exp_v1",
-    "2026-02-19T00:00Z_Exp_v2",
-    "Dataset_Ref_Standard",
-    "Calibration_Run_01"
-]
-
-# Instantiate the browser
-browser = DatasetBrowser(datasets=dataset_names)
-
-# Define a display area to show what is happening (for debugging)
-status_info = pn.Column(
-    pn.bind(lambda x: f"### 🔍 Focused Dataset: `{x}`" if x else "### 🔍 Select a dataset", browser.param.active_dataset),
-    pn.bind(lambda x: f"**✅ Items to Plot:** {', '.join(x) if x else 'None'}", browser.param.checked_items),
-    width=400,
-    margin=(0, 0, 0, 20)
-)
-
-# Final Layout
-layout = pn.Row(
-    pn.Column("## Dataset Browser", browser.panel, width=350),
-    status_info
-).servable()
+## Simulated Dataset Names
+#dataset_names = [
+#    "2026-02-18T00:00Z_Control",
+#    "2026-02-18T06:00Z_Control",
+#    "2026-02-18T12:00Z_Exp_v1",
+#    "2026-02-18T18:00Z_Exp_v1",
+#    "2026-02-19T00:00Z_Exp_v2",
+#    "Dataset_Ref_Standard",
+#    "Calibration_Run_01"
+#]
+#
+## Instantiate the browser
+#browser = DatasetBrowser(datasets=dataset_names)
+#
+## Define a display area to show what is happening (for debugging)
+#status_info = pn.Column(
+#    pn.bind(lambda x: f"### 🔍 Focused Dataset: `{x}`" if x else "### 🔍 Select a dataset", browser.param.active_dataset),
+#    pn.bind(lambda x: f"**✅ Items to Plot:** {', '.join(x) if x else 'None'}", browser.param.checked_items),
+#    width=400,
+#    margin=(0, 0, 0, 20)
+#)
+#
+## Final Layout
+#layout = pn.Row(
+#    pn.Column("## Dataset Browser", browser.panel, width=350),
+#    status_info
+#).servable()

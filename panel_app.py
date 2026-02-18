@@ -5,6 +5,10 @@ from era5_plot import plot_png, NETCDF_FILE, VAR_NAME, TIME_NAME, LEV_NAME, PRES
 import panel as pn
 import param
 
+from datasetSelector2 import DatasetBrowser
+from metadata import DatasetMetadata
+from datasetPlot import DatasetPlot2
+
 #pn.extension(css_files=["static/styles.css"])
 pn.extension(raw_css=[Path("static/styles.css").read_text()])
 #pn.extension()
@@ -199,49 +203,19 @@ dataset_select = pn.widgets.CheckBoxGroup(
     value=[]
 )
 
-#def dataset_row(label):
-#    checkbox = pn.widgets.Checkbox(value=False, margin=0)
-#
-#    row = pn.widgets.Button(
-#        button_type="light",
-#        align="start",
-#        sizing_mode="stretch_width",
-#        css_classes=["dataset-row"]
-#    )
-#
-#    content = pn.Row(
-#        checkbox,
-#        pn.pane.Markdown(label, margin=(0, 0, 0, 6)),
-#        align="center"
-#    )
-#
-#    row.objects = [content]
-#
-#    def toggle(event):
-#        checkbox.value = not checkbox.value
-#
-#    row.on_click(toggle)
-#
-#    return row, checkbox
-#
-#rows = []
-#checkboxes = {}
-#
-#for ds in available_datasets():
-#    print("making row for " + ds)
-#    row, cb = dataset_row(ds)
-#    rows.append(row)
-#    checkboxes[ds] = cb
+browser = DatasetBrowser(datasets=available_datasets())
 
 # Step 3: Build the image grid reactively
-@pn.depends(dataset_select.param.value)
+#@pn.depends(dataset_select.param.value)
+@pn.depends(browser.param.checked_items)
 def plot_grid(datasets):
 
     if not datasets:
         return pn.pane.Markdown("### Select one or more datasets")
 
     plots = [
-        DatasetPlot(dataset=ds).panel()
+        #DatasetPlot(dataset=ds).panel()
+        DatasetPlot2(dataset=ds, metadata=DATASET_METADATA).panel()
         for ds in datasets
     ]
 
@@ -260,104 +234,22 @@ def plot_grid(datasets):
         #}
     )
 
-class SelectableCheckboxList(param.Parameterized):
-    checked_items = param.List(default=[])
-    active_selection = param.String(default="")
+metadata = DatasetMetadata(metadata=DATASET_METADATA)
+# Instead of browser.link(metadata_viewer, active_dataset='active_key')
+def sync_active_dataset(event):
+    metadata.active_key = event.new
+browser.param.watch(sync_active_dataset, 'active_dataset')
 
-    def __init__(self, options, **params):
-        super().__init__(**params)
-        self.options = options
-        self._rows = {}
-
-    def _get_row_style(self, name):
-        """Returns the CSS classes/styles based on active state."""
-        # We can use a CSS class or inline styles
-        base_style = {
-            "display": "flex", 
-            "align-items": "center", 
-            "padding": "5px",
-            "border-radius": "4px",
-            "margin": "2px 0"
-        }
-        if name == self.active_selection:
-            base_style.update({"background-color": "#e0f0ff", "font-weight": "bold"})
-        return base_style
-
-    def _create_row(self, name):
-        # 1. Checkbox for multi-select
-        cb = pn.widgets.Checkbox(name="", value=(name in self.checked_items), width=30)
-        
-        def update_checked(event):
-            current = list(self.checked_items)
-            if event.new and name not in current:
-                current.append(name)
-            elif not event.new and name in current:
-                current.remove(name)
-            self.checked_items = current
-        cb.param.watch(update_checked, 'value')
-
-        # 2. Button for the label (Removing 'plain' to fix your error)
-        # We use button_type="light" or "default" and CSS to flatten it
-        btn = pn.widgets.Button(
-            name=name, 
-            button_type="default", 
-            sizing_mode="stretch_width",
-            stylesheets=[
-                """
-                :host(.bk-btn-default) .bk-btn {
-                    background-color: transparent !important;
-                    border: none !important;
-                    text-align: left !important;
-                    box-shadow: none !important;
-                    padding-left: 5px !important;
-                }
-                :host(.bk-btn-default) .bk-btn:hover {
-                    background-color: rgba(0,0,0,0.05) !important;
-                }
-                """
-            ]
-        )
-        
-        def handle_selection(event):
-            self.active_selection = name
-            self._update_ui()
-        
-        btn.on_click(handle_selection)
-
-        # 3. The Container Row
-        row = pn.Row(cb, btn, styles=self._get_row_style(name))
-        self._rows[name] = row
-        return row
-
-    def _update_ui(self):
-        """Refreshes the styles of all rows to reflect the new active selection."""
-        for name, row in self._rows.items():
-            row.styles = self._get_row_style(name)
-
-    @property
-    def panel(self):
-        return pn.Column(
-            *[self._create_row(opt) for opt in self.options],
-            sizing_mode="stretch_width"
-        )
-
-custom_list = SelectableCheckboxList(options=available_datasets())
-
-new_row = pn.Row(
-    pn.Column("## Datasets", custom_list.panel, width=300),
-    pn.Column(
-        "### Status",
-        pn.bind(lambda x: f"**Checked:** {x}", custom_list.param.checked_items),
-        pn.bind(lambda x: f"**Last Clicked:** {x}", custom_list.param.active_selection),
-    )
-)
+print(DATASET_METADATA)
 
 # Layout
 sidebar = pn.Column(
     "## Datasets",
-    dataset_select,
-    new_row,
+    #dataset_select,
+    browser.panel,
+    metadata.panel,
     width=250
+    #width=550
     #css_classes=["credit-app"]    
     #styles={"background"   : "#f5f5f5",
     #        "padding"      : "15px",
@@ -374,11 +266,20 @@ main = pn.Column(
     css_classes=["main-content"]    
 )
 
-pn.Row(
+vis = pn.Row(
     sidebar,
     main,
     sizing_mode="stretch_both",
     styles={"height" : "100vh"}
     #css_classes=["credit-app"]    
-).servable()
+)
+#).servable()
 
+inference = pn.Column(
+    pn.widgets.TextEditor(placeholder='Enter some text')
+)
+
+tabs = pn.Tabs(
+    ("Visualization", vis),
+    ("Inference", inference)
+).servable()
