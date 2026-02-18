@@ -73,7 +73,7 @@ class DatasetBrowser1(param.Parameterized):
 import panel as pn
 import param
 
-class DatasetBrowser(param.Parameterized):
+class DatasetBrowser2(param.Parameterized):
     checked_datasets = param.List(default=[])
     active_dataset = param.String(default="")
 
