@@ -1,4 +1,25 @@
-# Step 1: Load datasets dynamically
+# Panel App – How to Run on NCAR JupyterHub (HPC)
+#
+# 1) Log into JupyterHub:
+#    https://jupyterhub.hpc.ucar.edu/
+#
+# 2) Open a Terminal in JupyterLab
+#
+# 3) Activate the conda environment (if needed):
+#    conda activate <YOUR_CONDA_ENV>
+#
+# 4) Navigate to this file’s directory
+#
+# 5) Start the Panel server (keep this terminal running):
+#    panel serve panel_app.py --address 127.0.0.1 --port 5006 \
+#        --allow-websocket-origin="jupyterhub.hpc.ucar.edu"
+#
+# 6) Open the app in your browser (same JupyterHub session):
+#    https://jupyterhub.hpc.ucar.edu/stable/user/<USER_NAME>/proxy/5006/panel_app
+#
+# 7) Stop the app:
+#    Go back to the terminal and press Ctrl+C
+
 import xarray as xr
 from pathlib import Path
 from era5_plot import plot_png, NETCDF_FILE, VAR_NAME, TIME_NAME, LEV_NAME, PRES_NAME, LAT_NAME, LON_NAME
