@@ -15,9 +15,15 @@ from visualization.datasetPlot import DatasetPlot2, SharedPlotControls
 from visualization.forecastStatsPanel import ForecastStatsPanel
 from visualization.loadSuiteDialog import LoadSuiteDialog
 from visualization.videoExport import VideoExportPanel
+from visualization.plotGrid import PlotGrid, PlotGridState
+from visualization.earth2StudioPlot import close_dataset_cache
 
 from inference.commandRunner import CommandRunner
 from inference.inferenceTab import InferenceTab
+
+# Model-difference cache. Each pair gets its own subdirectory (see
+# modelDiff.compute_model_difference), so this is the parent only.
+DIFF_CACHE_DIR = Path(f"/glade/derecho/scratch/{os.environ['USER']}/.inferstudio_diff_cache")
 
 # --- Static asset locations ------------------------------------------------
 # Resolved relative to THIS module, not the process working directory, so the
@@ -166,6 +172,96 @@ def scan_datasets(data_dir):
     return metadata
 
 
+# --- Suite / control adapters ---------------------------------------------
+# scan_simulation_suite already produces everything PlotGrid needs; these two
+# helpers just reshape it, so the grid never has to know about the metadata
+# dict's layout.
+
+def model_dirs_for(entry: dict) -> dict:
+    """{model name: directory} for a suite entry, or {} for a flat dataset.
+
+    A flat dataset (ExampleDataset) has no "models" key — it's a single
+    directory of .nc files with no per-model breakdown, which is why it
+    still routes to DatasetPlot2 below rather than to the model grid.
+    """
+    return {name: Path(m["path"]) for name, m in entry.get("models", {}).items()}
+
+def link_controls(controls, state):
+    """Bridge SharedPlotControls -> PlotGridState.
+
+    SharedPlotControls is the single source of truth; PlotGridState exists
+    because the grid's DynamicMap streams need a param object holding
+    exactly the fields that should trigger a reload, and no others. The
+    mapping is one line per control, so if any of these names differ in
+    datasetPlot.py this is the only place to fix them.
+    """
+    mapping = {
+        "time_index": "time_index",
+        "var_name": "variable",
+        "level_value": "level",
+        "colormap": "cmap",
+        "cmap_min": "cmap_min",
+        "cmap_max": "cmap_max",
+    }
+
+    def _coerce(dst, value):
+        """Convert a widget value to the type PlotGridState declares.
+
+        Necessary because the widgets yield whatever the widgets yield — the
+        Level Select gives a string ("500") while leveled_vars_cf stores
+        floats, and param.Integer rejects both. Doing this at the boundary
+        keeps the coercion in one place; without it a ValueError is raised
+        from inside a param watcher, which propagates out of whatever
+        assignment triggered it (typically browser.checked_items) rather
+        than showing up anywhere near the real cause.
+        """
+        if dst == "level":
+            # level_value is 0, not None, for surface variables — passing 0
+            # through would make load_e2s_field try to select pressure=0.
+            if value in (None, "", "None", 0):
+                return None
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                return None
+        if dst == "time_index":
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return 0
+        if dst == "cmap":
+            # cmocean names aren't registered with matplotlib globally, so a
+            # bare name string can fail in HoloViews. Resolve through the
+            # controls' own name->Colormap dict, which is what DatasetPlot2
+            # does too.
+            cm = getattr(controls, "_colormaps", {}).get(value)
+            return cm if cm is not None else (value or "viridis")
+        if dst in ("cmap_min", "cmap_max"):
+            try:
+                return float(value or 0.0)
+            except (TypeError, ValueError):
+                return 0.0
+        return value
+
+    print("link_controls: params =", sorted(controls.param), flush=True)
+    print("link_controls: widget attrs =",
+          [a for a in dir(controls)
+           if not a.startswith("_")
+           and isinstance(getattr(controls, a, None), pn.widgets.Widget)],
+          flush=True)
+
+    for src, dst in mapping.items():
+        if not hasattr(controls, src):
+            print(f"link_controls: SharedPlotControls has no {src!r} — skipping")
+            continue
+        # Push the current value across before wiring the watcher, so the
+        # grid's first render already reflects the sidebar rather than the
+        # PlotGridState defaults.
+        setattr(state, dst, _coerce(dst, getattr(controls, src)))
+        controls.param.watch(
+            lambda ev, dst=dst: setattr(state, dst, _coerce(dst, ev.new)), src
+        )
+
 def build_app(data_dir):
     dataset_metadata = scan_datasets(data_dir)
     datasets = sorted(d.name for d in data_dir.iterdir() if d.is_dir())
@@ -174,6 +270,13 @@ def build_app(data_dir):
 
     controls = SharedPlotControls()
     controls.update_choices(browser.checked_items, dataset_metadata)
+
+    # One PlotGridState for the whole session, outliving every PlotGrid built
+    # against it. This is what lets the suite change without rebinding the
+    # sidebar: binding watchers to a grid instance instead would leave a stale
+    # watcher attached on every dataset switch, and they'd accumulate.
+    grid_state = PlotGridState()
+    link_controls(controls, grid_state)
 
     def sync_active(event):
         meta_panel.active_key = event.new
@@ -287,32 +390,97 @@ def build_app(data_dir):
     load_suite_dialog.open_button.sizing_mode = "stretch_width"
     load_suite_dialog.open_button.margin = (10, 10, 0, 0)
 
-    # Holds the DatasetPlot2 instance currently on screen, so the video
-    # exporter can ask it what it's rendering. A dict rather than a bare
-    # local because plot_grid (a closure) needs to rebind it on every
-    # dataset change, and the exporter needs to see that new value.
+    # Holds whatever is currently on screen — a PlotGrid for a simulation
+    # suite, or a DatasetPlot2 for a flat single dataset. A dict rather than
+    # a bare local because plot_grid (a closure) rebinds it on every dataset
+    # change, and the video exporter needs to see the new value.
     _active_plot = {"obj": None}
+
+    # Sidebar container for the per-model difference selectors. These used to
+    # sit under each model's plot card; hv.Layout can't host Panel widgets
+    # between its panels, so they live here alongside the other field
+    # controls. Repopulated by plot_grid on every dataset change.
+    diff_slot = pn.Column(sizing_mode="stretch_width", margin=(0, 10, 0, 0))
 
     @pn.depends(browser.param.checked_items)
     def plot_grid(datasets):
+        # Detach the outgoing grid before building its replacement. Its
+        # streams stay subscribed to the shared grid_state otherwise, so it
+        # would keep loading fields from the previous suite on every slider
+        # tick and race the new grid over header_text.
+        prev = _active_plot.get("obj")
+        if hasattr(prev, "teardown"):
+            prev.teardown()
+
         if not datasets:
             _active_plot["obj"] = None
+            diff_slot.objects = []
             return pn.pane.Markdown("### Select one or more datasets")
+
         ds = datasets[0]
-        plot = DatasetPlot2(controls=controls, dataset=ds, metadata=dataset_metadata)
-        _active_plot["obj"] = plot
-        return plot.panel()
+        entry = dataset_metadata.get(ds, {})
+        model_dirs = model_dirs_for(entry)
+
+        if not model_dirs:
+            # Flat dataset (no per-model subdirectories) — there are no model
+            # pairs to difference and no grid to link, so this keeps the
+            # original single-plot path.
+            plot = DatasetPlot2(controls=controls, dataset=ds, metadata=dataset_metadata)
+            _active_plot["obj"] = plot
+            diff_slot.objects = []
+            return plot.panel()
+
+        grid = PlotGrid(
+            models=list(model_dirs),
+            model_dirs=model_dirs,
+            diff_cache_dir=DIFF_CACHE_DIR,
+            state=grid_state,
+        )
+        # ntime already came out of the scan, so the forecast length is set
+        # without touching the filesystem again.
+        grid.set_time_bounds(entry.get("ntime", 1))
+        _active_plot["obj"] = grid
+        diff_slot.objects = [grid.diff_selectors()]
+        grid.refresh_clims_async()
+        return grid.card(title=ds)    
 
     @pn.depends(browser.param.checked_items)
     def stats_panel(datasets):
         if not datasets:
             return pn.pane.Markdown("")
         ds = datasets[0]
-        return ForecastStatsPanel(controls=controls, dataset_key=ds, metadata=dataset_metadata).panel()
+
+        # Collapsed by default now that the plot grid above is a single tall
+        # card. Both the ForecastStatsPanel construction and its .panel() are
+        # deferred to first expand: Bokeh plots built inside a collapsed
+        # container come out with zero width and height, since the container
+        # reports no size at render time — and deferring only .panel() would
+        # still pay the constructor's data loading up front.
+        card = pn.Card(
+            pn.pane.Markdown("_Expand to compute verification statistics._"),
+            title="Forecast Verification Statistics",
+            collapsed=True,
+            sizing_mode="stretch_width",
+        )
+
+        def _populate(event):
+            if not event.new and not getattr(card, "_populated", False):
+                card._populated = True
+                stats = ForecastStatsPanel(
+                    controls=controls, dataset_key=ds, metadata=dataset_metadata)
+                card.objects = [stats.panel()]
+
+        card.param.watch(_populate, "collapsed")
+        return card    
 
     # Export Video — sweeps the shared time index across the full forecast
-    # and encodes the current rendering (all model cards, plus any active
-    # difference cards) to MP4 with ffmpeg.
+    # and encodes the current rendering to MP4 with ffmpeg.
+    #
+    # NOTE: with the grid now rendered by Bokeh client-side, there are no
+    # server-side image buffers to capture. VideoExportPanel must render its
+    # own frames via earth2StudioPlot.plot_e2s_field (retained for exactly
+    # this reason) using the spec returned by PlotGrid.frame_spec(); see the
+    # note below build_app.
     video_export = VideoExportPanel(controls, lambda: _active_plot["obj"])
 
     sidebar = pn.Column(
@@ -321,6 +489,7 @@ def build_app(data_dir):
         load_suite_dialog.open_button,
         load_suite_dialog.modal,
         controls.panel(),
+        diff_slot,
         video_export.open_button,
         video_export.modal,
         pn.pane.HTML("<h2 style='margin: 5px 0; font-size: 14px; font-weight: bold;'>Metadata</h2>"),
@@ -418,7 +587,7 @@ def build_app(data_dir):
     def _show_welcome():
         if pn.state.notifications:
             pn.state.notifications.info(
-                "Welcome to InferStudio.<br><br>"
+                "Welcome to InferStudio!<br><br>"
                 "You are currently viewing information from "
                 "an example dataset. To run your own AI weather model inference, go "
                 "to the Inference tab.<br><br> Then select your desired parameters, click "
@@ -428,6 +597,12 @@ def build_app(data_dir):
             )
 
     pn.state.onload(_show_welcome)
+
+    # earth2StudioPlot holds datasets open (dask-backed) so the grid's
+    # DynamicMap callbacks don't reopen an mfdataset on every slider tick.
+    # Release the file handles when the session ends — on a long-lived OOD
+    # server these would otherwise accumulate across sessions.
+    pn.state.on_session_destroyed(lambda ctx: close_dataset_cache())
 
     return template
 
