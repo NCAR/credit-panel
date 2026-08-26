@@ -426,6 +426,11 @@ class DatasetPlot2(param.Parameterized):
         # than resetting back to "no diff" on every render.
         self._diff_selectors = {}       # model -> Select widget
         self._diff_slots = {}           # model -> Column that holds the diff card (empty when none selected)
+        # model -> cached difference dataset dir, for whichever diffs are
+        # currently displayed. compute_model_difference already returns
+        # this path; retaining it lets export_panels() below describe the
+        # diff cards without recomputing anything.
+        self._diff_paths = {}
 
         self._sections = pn.Column(sizing_mode="stretch_width")
         for model in self.models:
@@ -544,6 +549,7 @@ class DatasetPlot2(param.Parameterized):
 
         if selected_option == "\u2014":
             slot.objects = []
+            self._diff_paths.pop(model, None)   # no diff card on screen anymore
             return
 
         # "AIFS minus Aurora" -> other = "Aurora"
@@ -573,7 +579,10 @@ class DatasetPlot2(param.Parameterized):
             )
         except Exception as e:
             slot.objects = [pn.pane.Markdown(f"*Error computing difference: {e}*")]
+            self._diff_paths.pop(model, None)   # nothing renderable to export
             return
+
+        self._diff_paths[model] = diff_path
 
         label = f"{model} minus {other}"
         diff_view = pn.bind(
@@ -633,6 +642,29 @@ class DatasetPlot2(param.Parameterized):
             )
         except Exception as e:
             return pn.pane.Markdown(f"*Error plotting difference: {e}*")
+
+    def export_panels(self):
+        """Describe what this plot grid is currently rendering.
+
+        Returns a list of rows, each a list of (label, model_dir, is_diff)
+        tuples, mirroring the on-screen layout: one row per plottable
+        model, with its difference card alongside when one is selected.
+        Models without a wired-up plotting branch are omitted, since they
+        have nothing to render into a frame.
+
+        Deliberately returns plain tuples rather than any videoExport type,
+        so this module stays independent of the export machinery.
+        """
+        rows = []
+        for model in self.models:
+            if model not in EARTH2STUDIO_FORMAT_MODELS:
+                continue
+            row = [(model, self.model_paths[model], False)]
+            diff_path = self._diff_paths.get(model)
+            if diff_path:
+                row.append((self._diff_selectors[model].value, diff_path, True))
+            rows.append(row)
+        return rows
 
     def panel(self):
         return pn.Column(

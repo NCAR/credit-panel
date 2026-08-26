@@ -2,16 +2,20 @@
 import os
 import base64
 import warnings
-import xarray as xr
 import panel as pn
-from functools import lru_cache
+import xarray as xr
 from pathlib import Path
+from functools import lru_cache
+
 from dimensions import LEV_NAME, PRES_NAME, LAT_NAME, LON_NAME, resolve_nc_glob
+
 from visualization.datasetSelector2 import DatasetBrowser
 from visualization.metadata import DatasetMetadata
 from visualization.datasetPlot import DatasetPlot2, SharedPlotControls
 from visualization.forecastStatsPanel import ForecastStatsPanel
 from visualization.loadSuiteDialog import LoadSuiteDialog
+from visualization.videoExport import VideoExportPanel
+
 from inference.commandRunner import CommandRunner
 from inference.inferenceTab import InferenceTab
 
@@ -283,12 +287,21 @@ def build_app(data_dir):
     load_suite_dialog.open_button.sizing_mode = "stretch_width"
     load_suite_dialog.open_button.margin = (10, 10, 0, 0)
 
+    # Holds the DatasetPlot2 instance currently on screen, so the video
+    # exporter can ask it what it's rendering. A dict rather than a bare
+    # local because plot_grid (a closure) needs to rebind it on every
+    # dataset change, and the exporter needs to see that new value.
+    _active_plot = {"obj": None}
+
     @pn.depends(browser.param.checked_items)
     def plot_grid(datasets):
         if not datasets:
+            _active_plot["obj"] = None
             return pn.pane.Markdown("### Select one or more datasets")
         ds = datasets[0]
-        return DatasetPlot2(controls=controls, dataset=ds, metadata=dataset_metadata).panel()
+        plot = DatasetPlot2(controls=controls, dataset=ds, metadata=dataset_metadata)
+        _active_plot["obj"] = plot
+        return plot.panel()
 
     @pn.depends(browser.param.checked_items)
     def stats_panel(datasets):
@@ -297,12 +310,19 @@ def build_app(data_dir):
         ds = datasets[0]
         return ForecastStatsPanel(controls=controls, dataset_key=ds, metadata=dataset_metadata).panel()
 
+    # Export Video — sweeps the shared time index across the full forecast
+    # and encodes the current rendering (all model cards, plus any active
+    # difference cards) to MP4 with ffmpeg.
+    video_export = VideoExportPanel(controls, lambda: _active_plot["obj"])
+
     sidebar = pn.Column(
         pn.pane.HTML("<h2 style='margin: 5px 0; font-size: 14px; font-weight: bold;'>Datasets</h2>"),
         browser.panel,
         load_suite_dialog.open_button,
         load_suite_dialog.modal,
         controls.panel(),
+        video_export.open_button,
+        video_export.modal,
         pn.pane.HTML("<h2 style='margin: 5px 0; font-size: 14px; font-weight: bold;'>Metadata</h2>"),
         meta_panel.panel,
         width=250,
