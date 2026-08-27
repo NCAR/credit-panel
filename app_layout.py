@@ -62,13 +62,13 @@ def scan_single_dataset(dataset_dir: Path) -> dict:
             lat_dim = _resolve_dim(ds, LAT_NAME, "lat")
             lon_dim = _resolve_dim(ds, LON_NAME, "lon")
 
-            # Forecast-style earth2studio output (AIFS/Aurora/Pangu/...) has
-            # a size-1 `time` dim (the init/cycle time) plus a separate
-            # `lead_time` dim holding the actual forecast steps. ERA5-style
-            # files have no `lead_time` and step through `time` directly.
-            # Prefer `lead_time` as the "number of forecast steps" dimension
-            # whenever it's present and non-trivial, instead of always
-            # reading the (possibly size-1) init-time dim.
+            # Pre-cf_convert earth2studio output has a size-1 `time` dim (the
+            # init/cycle time) plus a separate `lead_time` dim holding the
+            # actual forecast steps. Post-conversion, cf_convert collapses
+            # those into a single `time` axis of VALID times, so this branch
+            # only fires for legacy files. ERA5-style files never had
+            # lead_time and step through `time` directly, same as converted
+            # output does.
             has_lead_time = "lead_time" in ds.sizes and ds.sizes["lead_time"] > 1
 
             if has_lead_time:
@@ -98,6 +98,23 @@ def scan_single_dataset(dataset_dir: Path) -> dict:
                     if PRES_NAME in ds[v].dims:
                         leveled_vars_cf[v] = pressure_values
 
+            # Classify by whether a variable actually spans pressure levels,
+            # not by raw dimension count. The count test worked only by
+            # accident: pre-conversion, surface fields were
+            # (time=1, lead_time, lat, lon) = 4 dims, same as leveled ones
+            # once you count the flattened name as its own variable - so
+            # msl/sp/t2m were landing in vars3d. Post-conversion the counts
+            # happen to come out right (3 vs 4), but testing for the
+            # pressure dimension says what is actually meant.
+            if PRES_NAME in ds.coords:
+                vars2d = [v for v in ds.data_vars if PRES_NAME not in ds[v].dims]
+                vars3d = [v for v in ds.data_vars if PRES_NAME in ds[v].dims]
+            else:
+                # Legacy files have no pressure coordinate at all; fall back
+                # to the original heuristic for those.
+                vars2d = [v for v in ds.data_vars if len(ds[v].dims) <= 3]
+                vars3d = [v for v in ds.data_vars if len(ds[v].dims) > 3]
+
             return {
                 "path": str(dataset_dir),
                 "ntime": ntime,
@@ -107,8 +124,8 @@ def scan_single_dataset(dataset_dir: Path) -> dict:
                 "nlon": int(ds.sizes[lon_dim]) if lon_dim else 0,
                 "stime": stime,
                 "etime": etime,
-                "vars2d": [v for v in ds.data_vars if len(ds[v].dims) <= 3],
-                "vars3d": [v for v in ds.data_vars if len(ds[v].dims) > 3],
+                "vars2d": sorted(vars2d),
+                "vars3d": sorted(vars3d),
                 "leveled_vars_cf": leveled_vars_cf,
             }
 
@@ -180,20 +197,23 @@ def scan_datasets(data_dir):
 def model_dirs_for(entry: dict) -> dict:
     """{model name: directory} for a suite entry, or {} for a flat dataset.
 
-    A flat dataset (ExampleDataset) has no "models" key — it's a single
+    A flat dataset (ExampleDataset) has no "models" key - it's a single
     directory of .nc files with no per-model breakdown, which is why it
     still routes to DatasetPlot2 below rather than to the model grid.
     """
     return {name: Path(m["path"]) for name, m in entry.get("models", {}).items()}
+
 
 def link_controls(controls, state):
     """Bridge SharedPlotControls -> PlotGridState.
 
     SharedPlotControls is the single source of truth; PlotGridState exists
     because the grid's DynamicMap streams need a param object holding
-    exactly the fields that should trigger a reload, and no others. The
-    mapping is one line per control, so if any of these names differ in
-    datasetPlot.py this is the only place to fix them.
+    exactly the fields that should trigger a reload, and no others.
+
+    Note the keys are NOT the same words as the values: the controls object
+    predates the grid and uses var_name/level_value/colormap where the grid
+    uses variable/level/cmap.
     """
     mapping = {
         "time_index": "time_index",
@@ -207,17 +227,18 @@ def link_controls(controls, state):
     def _coerce(dst, value):
         """Convert a widget value to the type PlotGridState declares.
 
-        Necessary because the widgets yield whatever the widgets yield — the
-        Level Select gives a string ("500") while leveled_vars_cf stores
-        floats, and param.Integer rejects both. Doing this at the boundary
-        keeps the coercion in one place; without it a ValueError is raised
-        from inside a param watcher, which propagates out of whatever
-        assignment triggered it (typically browser.checked_items) rather
-        than showing up anywhere near the real cause.
+        Necessary because the widgets yield whatever the widgets yield -
+        the Level Select gives a string ("500") while leveled_vars_cf
+        stores floats, and param.Integer rejects both. Doing this at the
+        boundary keeps the coercion in one place; without it a ValueError
+        is raised from inside a param watcher, which propagates out of
+        whatever assignment triggered it (typically browser.checked_items)
+        rather than showing up anywhere near the real cause.
         """
         if dst == "level":
-            # level_value is 0, not None, for surface variables — passing 0
-            # through would make load_e2s_field try to select pressure=0.
+            # level_value is 0, not None, for surface variables - see
+            # SharedPlotControls._update_level_options. Passing 0 through
+            # would make load_e2s_field try to select pressure=0.
             if value in (None, "", "None", 0):
                 return None
             try:
@@ -230,12 +251,14 @@ def link_controls(controls, state):
             except (TypeError, ValueError):
                 return 0
         if dst == "cmap":
-            # cmocean names aren't registered with matplotlib globally, so a
-            # bare name string can fail in HoloViews. Resolve through the
-            # controls' own name->Colormap dict, which is what DatasetPlot2
-            # does too.
+            # cmocean's colormaps are not registered with matplotlib
+            # globally, so a bare name string can fail downstream. Resolve
+            # through the controls' own name->Colormap dict, which is what
+            # DatasetPlot2 does too.
             cm = getattr(controls, "_colormaps", {}).get(value)
-            return cm if cm is not None else (value or "viridis")
+            if cm is not None:
+                return cm
+            return value if isinstance(value, str) else "viridis"
         if dst in ("cmap_min", "cmap_max"):
             try:
                 return float(value or 0.0)
@@ -243,16 +266,9 @@ def link_controls(controls, state):
                 return 0.0
         return value
 
-    print("link_controls: params =", sorted(controls.param), flush=True)
-    print("link_controls: widget attrs =",
-          [a for a in dir(controls)
-           if not a.startswith("_")
-           and isinstance(getattr(controls, a, None), pn.widgets.Widget)],
-          flush=True)
-
     for src, dst in mapping.items():
         if not hasattr(controls, src):
-            print(f"link_controls: SharedPlotControls has no {src!r} — skipping")
+            print(f"link_controls: SharedPlotControls has no {src!r} - skipping")
             continue
         # Push the current value across before wiring the watcher, so the
         # grid's first render already reflects the sidebar rather than the
@@ -261,6 +277,7 @@ def link_controls(controls, state):
         controls.param.watch(
             lambda ev, dst=dst: setattr(state, dst, _coerce(dst, ev.new)), src
         )
+
 
 def build_app(data_dir):
     dataset_metadata = scan_datasets(data_dir)
@@ -273,8 +290,8 @@ def build_app(data_dir):
 
     # One PlotGridState for the whole session, outliving every PlotGrid built
     # against it. This is what lets the suite change without rebinding the
-    # sidebar: binding watchers to a grid instance instead would leave a stale
-    # watcher attached on every dataset switch, and they'd accumulate.
+    # sidebar: binding watchers to a grid instance instead would leave a
+    # stale watcher attached on every dataset switch, and they'd accumulate.
     grid_state = PlotGridState()
     link_controls(controls, grid_state)
 
@@ -347,13 +364,13 @@ def build_app(data_dir):
             dataset_metadata[key] = scan_simulation_suite(sim_dir)
         except Exception as e:
             # scan_simulation_suite raises RuntimeError specifically when
-            # no supported model (AIFS, Aurora, ...) output was found —
+            # no supported model (AIFS, Aurora, ...) output was found -
             # this is also where any other scan failure surfaces (e.g.
             # unreadable/corrupt files). Full detail (including the full
             # path) goes in the dialog's own inline error; the toast
             # notification is kept short deliberately, since Notyf-style
             # toasts have a fixed size and don't wrap/expand for long
-            # text — putting the full path + exception text in the toast
+            # text - putting the full path + exception text in the toast
             # was getting visually clipped.
             load_suite_dialog.report_error(
                 f"Could not load a simulation suite from {sim_dir}: {e}"
@@ -384,13 +401,13 @@ def build_app(data_dir):
     )
     # Match the Datasets checkbox panel's width exactly: that panel is
     # sizing_mode="stretch_width" with margin=(0, 10, 0, 0) (a 10px right
-    # margin — see DatasetBrowser._column in datasetSelector2.py), so
+    # margin - see DatasetBrowser._column in datasetSelector2.py), so
     # giving this button the identical sizing_mode + right margin makes
     # both stretch to the exact same effective width within the sidebar.
     load_suite_dialog.open_button.sizing_mode = "stretch_width"
     load_suite_dialog.open_button.margin = (10, 10, 0, 0)
 
-    # Holds whatever is currently on screen — a PlotGrid for a simulation
+    # Holds whatever is currently on screen - a PlotGrid for a simulation
     # suite, or a DatasetPlot2 for a flat single dataset. A dict rather than
     # a bare local because plot_grid (a closure) rebinds it on every dataset
     # change, and the video exporter needs to see the new value.
@@ -407,7 +424,7 @@ def build_app(data_dir):
         # Detach the outgoing grid before building its replacement. Its
         # streams stay subscribed to the shared grid_state otherwise, so it
         # would keep loading fields from the previous suite on every slider
-        # tick and race the new grid over header_text.
+        # tick and race the new grid over the readout.
         prev = _active_plot.get("obj")
         if hasattr(prev, "teardown"):
             prev.teardown()
@@ -422,7 +439,7 @@ def build_app(data_dir):
         model_dirs = model_dirs_for(entry)
 
         if not model_dirs:
-            # Flat dataset (no per-model subdirectories) — there are no model
+            # Flat dataset (no per-model subdirectories) - there are no model
             # pairs to difference and no grid to link, so this keeps the
             # original single-plot path.
             plot = DatasetPlot2(controls=controls, dataset=ds, metadata=dataset_metadata)
@@ -442,7 +459,7 @@ def build_app(data_dir):
         _active_plot["obj"] = grid
         diff_slot.objects = [grid.diff_selectors()]
         grid.refresh_clims_async()
-        return grid.card(title=ds)    
+        return grid.card(title=ds)
 
     @pn.depends(browser.param.checked_items)
     def stats_panel(datasets):
@@ -454,7 +471,7 @@ def build_app(data_dir):
         # card. Both the ForecastStatsPanel construction and its .panel() are
         # deferred to first expand: Bokeh plots built inside a collapsed
         # container come out with zero width and height, since the container
-        # reports no size at render time — and deferring only .panel() would
+        # reports no size at render time - and deferring only .panel() would
         # still pay the constructor's data loading up front.
         card = pn.Card(
             pn.pane.Markdown("_Expand to compute verification statistics._"),
@@ -471,16 +488,15 @@ def build_app(data_dir):
                 card.objects = [stats.panel()]
 
         card.param.watch(_populate, "collapsed")
-        return card    
+        return card
 
-    # Export Video — sweeps the shared time index across the full forecast
+    # Export Video - sweeps the shared time index across the full forecast
     # and encodes the current rendering to MP4 with ffmpeg.
     #
     # NOTE: with the grid now rendered by Bokeh client-side, there are no
     # server-side image buffers to capture. VideoExportPanel must render its
     # own frames via earth2StudioPlot.plot_e2s_field (retained for exactly
-    # this reason) using the spec returned by PlotGrid.frame_spec(); see the
-    # note below build_app.
+    # this reason) using the spec returned by PlotGrid.frame_spec().
     video_export = VideoExportPanel(controls, lambda: _active_plot["obj"])
 
     sidebar = pn.Column(
@@ -518,7 +534,7 @@ def build_app(data_dir):
             .bk-tabs-content { border: 1px solid #ccc; padding: 10px; }
         """],
     )
-    # `title` now only drives the browser tab text — the header title text is
+    # `title` now only drives the browser tab text - the header title text is
     # supplied by the wordmark image below, so it is no longer set to "".
     template = pn.template.BootstrapTemplate(
         title="InferStudio",
@@ -528,7 +544,7 @@ def build_app(data_dir):
     )
     # InferStudio wordmark, replacing the plain-text HTML title pane. The
     # HSpacer takes over the layout job the old pane's stretch_width was
-    # doing — pushing the spinner and NSF NCAR logo to the right edge.
+    # doing - pushing the spinner and NSF NCAR logo to the right edge.
     template.header.append(
         pn.pane.PNG(
             str(_LOGO_DIR / "wordmark_dark.png"),
@@ -579,7 +595,7 @@ def build_app(data_dir):
     # connected before it can actually display anything client-side.
     # Calling .info(...) synchronously at this point in build_app() runs
     # before that connection is guaranteed to be live, so the message was
-    # being silently dropped — this is why the welcome message never
+    # being silently dropped - this is why the welcome message never
     # appeared on initial launch, while the (unrelated) notification fired
     # from _on_new_output above worked fine, since by the time an
     # inference run completes the session has obviously been live for a
@@ -587,7 +603,7 @@ def build_app(data_dir):
     def _show_welcome():
         if pn.state.notifications:
             pn.state.notifications.info(
-                "Welcome to InferStudio!<br><br>"
+                "Welcome to InferStudio.<br><br>"
                 "You are currently viewing information from "
                 "an example dataset. To run your own AI weather model inference, go "
                 "to the Inference tab.<br><br> Then select your desired parameters, click "
@@ -600,7 +616,7 @@ def build_app(data_dir):
 
     # earth2StudioPlot holds datasets open (dask-backed) so the grid's
     # DynamicMap callbacks don't reopen an mfdataset on every slider tick.
-    # Release the file handles when the session ends — on a long-lived OOD
+    # Release the file handles when the session ends - on a long-lived OOD
     # server these would otherwise accumulate across sessions.
     pn.state.on_session_destroyed(lambda ctx: close_dataset_cache())
 

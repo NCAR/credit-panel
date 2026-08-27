@@ -1,8 +1,8 @@
 """Linked, zoomable plot grid for InferStudio.
 
 Replaces the per-model Matplotlib cards with a single HoloViews Layout whose
-axes are shared, so a box-zoom on any panel applies to all of them. Panels
-are datashader-rasterized, so zooming re-aggregates server-side and resolves
+panels share axes, so a zoom on any panel applies to all of them. Panels are
+datashader-rasterized, so zooming re-aggregates server-side and resolves
 finer structure rather than magnifying pixels.
 
 Layout is (model, model-minus-other) per row:
@@ -13,20 +13,30 @@ Layout is (model, model-minus-other) per row:
     | Aurora         |  | Aurora minus Pangu       |
     +----------------+  +--------------------------+
 
+Navigation: scroll to zoom, drag to pan, double-click to reset. All three
+are permanently on and there is no toolbar to switch them off - the tools
+are declared in _panel_opts and the toolbar is suppressed in layout(), two
+different places for the reason the comment in layout() explains.
+
+Panels are linked by HoloViews' shared_axes. Note this links them PAIRWISE
+rather than all-to-all: instrumentation showed four figures carrying only
+two distinct Range1d objects, so a zoom propagates within a pair but not
+across the grid. Attempts to link all four explicitly - sharing Range1d
+objects server-side, and CustomJS callbacks client-side - both failed, so
+the partial linking stands for now. See the standalone repro script if
+picking this up again.
+
 Panels are RESPONSIVE: they fill whatever width the browser window gives
 them, at a fixed 2:1 aspect.
 
 Instead of Bokeh's per-panel hover tooltip, a single readout above the grid
-reports every model's value at the cursor position simultaneously — which is
+reports every model's value at the cursor position simultaneously - which is
 the comparison the grid exists to support, and which a tooltip showing one
 panel at a time cannot give. See _on_pointer.
 
 The per-cell "Compute Difference" selectors moved to the sidebar (see
-PlotGrid.diff_selectors) — Panel widgets can't be interleaved inside an
+PlotGrid.diff_selectors) - Panel widgets can't be interleaved inside an
 hv.Layout, and the sidebar is where the other field controls already live.
-
-Axis linking depends on every panel sharing dimension NAMES; that is handled
-upstream by earth2StudioPlot's CANON_LAT/CANON_LON canonicalization.
 
 Typical use:
 
@@ -55,6 +65,8 @@ import holoviews as hv
 from holoviews.operation.datashader import rasterize
 
 from visualization.earth2StudioPlot import load_e2s_field, field_range
+from visualization.earth2StudioPlot import (
+    load_e2s_field, field_range, CANON_LAT, CANON_LON)
 from visualization.modelDiff import (
     load_diff_field,
     compute_model_difference,
@@ -72,29 +84,34 @@ hv.extension("bokeh")
 # window, height follows from ASPECT.
 #
 # ASPECT is `aspect`, NOT `data_aspect`. data_aspect constrains the axis
-# RANGES to preserve a ratio, which fights box_zoom on any region that isn't
-# 2:1; aspect constrains the plot's rendered shape and leaves the ranges
-# alone.
+# RANGES to preserve a ratio, which fights zooming into any region that
+# isn't 2:1; aspect constrains the plot's rendered shape and leaves the
+# ranges alone.
 ASPECT = 2.0
 MIN_PANEL_WIDTH = 340
 COLORBAR_WIDTH = 12
 
+DEFAULT_CMAP = "viridis"
 DIFF_CMAP = "coolwarm"
 
+# Colormap for placeholder panels. Grey rather than a real colormap because
+# a placeholder carries no data - see _placeholder.
+PLACEHOLDER_CMAP = "gray"
+
 # Minimum seconds between readout updates. PointerXY fires on every mouse
-# move — without a gate that is hundreds of websocket messages per second of
+# move - without a gate that is hundreds of websocket messages per second of
 # cursor travel, each one re-rendering an HTML pane. 25 Hz is smooth to the
 # eye and roughly an order of magnitude less traffic.
 POINTER_MIN_INTERVAL = 0.04
 
 # Fallback extent for placeholder panels drawn before any real field has been
-# loaded. These models write longitude on 0..360, not -180..180 — a
-# placeholder claiming the wrong range would drag every linked panel to it
-# the moment shared_axes reconciles them. __init__ seeds _last_extent from a
-# real field, so this is only a fallback if that read fails.
+# loaded. These models write longitude on 0..360, not -180..180 - a
+# placeholder claiming the wrong range would drag every panel to it once the
+# axes are linked. __init__ seeds _last_extent from a real field, so this is
+# only a fallback if that read fails.
 GLOBAL_EXTENT = (0.0, -90.0, 360.0, 90.0)
 
-# "No explicit colour limits" — HoloViews reads (None, None) as autoscale
+# "No explicit colour limits" - HoloViews reads (None, None) as autoscale
 # from the data.
 #
 # This is deliberately NOT (nan, nan). A NaN clim produces a colour mapper
@@ -119,9 +136,9 @@ class PlotGridState(param.Parameterized):
     variable = param.String(default="q")
     level = param.Integer(default=500, allow_None=True)
 
-    # Either a colormap name or a matplotlib Colormap object — cmocean's
+    # Either a colormap name or a matplotlib Colormap object - cmocean's
     # colormaps are not registered globally, so they arrive as objects.
-    cmap = param.Parameter(default="viridis")
+    cmap = param.Parameter(default=DEFAULT_CMAP)
     cmap_min = param.Number(default=0.0)
     cmap_max = param.Number(default=0.0)
 
@@ -156,8 +173,8 @@ class PlotGridState(param.Parameterized):
 # diff landing, or a selector change, force six 721x1440 reloads of field
 # data that hasn't changed.
 #
-# cmap, cmap_min/max, the clim tuples and readout_html appear in NEITHER
-# list — those are restyles or pure display, and must not trigger a re-read.
+# cmap, cmap_min/max, the clim tuples and readout_rows appear in NEITHER
+# list - those are restyles or pure display, and must not trigger a re-read.
 _FIELD_PARAMS = ["time_index", "variable", "level"]
 _DIFF_PARAMS = ["time_index", "variable", "level", "diff_pairs", "diff_status"]
 
@@ -178,31 +195,34 @@ def _schedule(fn):
         pass
     fn()
 
+
 def _fmt(value):
-    """Format a field value compactly across the range of variables here.
+    """Format a field value for the cursor readout.
 
     %.4g would switch to scientific notation below 1e-4, which for specific
-    humidity differences is most values — and those strings are wide enough
-    to wrap the readout column. Fixed-point with enough decimals keeps the
-    width predictable and the decimal points aligned.
+    humidity differences is most values - and those strings are wide enough
+    to wrap the readout column, which grows the whole grid and pushes every
+    row below it down. Fixed-point where possible keeps the width
+    predictable and the decimal points aligned.
     """
     if value is None or not np.isfinite(value):
-        return "—"
+        return "\u2014"
     a = abs(value)
     if a >= 1000 or (a > 0 and a < 1e-6):
         return f"{value:.3e}"      # genuinely needs an exponent
     if a >= 1:
         return f"{value:.3f}"
-    return f"{value:.7f}"          # 6e-3, -3.4e-5 -> -0.0000344
+    return f"{value:.7f}"
+
 
 class PlotGrid(param.Parameterized):
     """Builds and owns the linked plot grid."""
 
     def __init__(self, models, model_dirs, diff_cache_dir, state=None):
         """
-        models         : list[str] — model names, in display order
-        model_dirs     : dict[str, Path] — model name -> directory of .nc files
-        diff_cache_dir : Path — e.g. /glade/derecho/scratch/pearse/
+        models         : list[str] - model names, in display order
+        model_dirs     : dict[str, Path] - model name -> directory of .nc files
+        diff_cache_dir : Path - e.g. /glade/derecho/scratch/pearse/
                                      .inferstudio_diff_cache/
         state          : PlotGridState, or None to create one
         """
@@ -228,10 +248,10 @@ class PlotGrid(param.Parameterized):
 
         # Extent of the most recently loaded field, so placeholder panels can
         # match it. A placeholder with a different extent would drag every
-        # linked panel to its range the moment shared_axes reconciles them —
-        # which is why this is seeded from a real field here rather than left
-        # on the constant: the first render is exactly when placeholder diff
-        # panels sit next to real field panels.
+        # panel to its range once the axes are linked - which is why this is
+        # seeded from a real field here rather than left on the constant: the
+        # first render is exactly when placeholder difference panels sit next
+        # to real field panels.
         self._last_extent = GLOBAL_EXTENT
         try:
             da, meta = load_e2s_field(
@@ -266,11 +286,12 @@ class PlotGrid(param.Parameterized):
         A stream holds a subscription to the PlotGridState for as long as it
         exists, and the state deliberately outlives every grid built against
         it (so the sidebar never needs rebinding). Without this, a replaced
-        grid keeps servicing every parameter change off-screen — reloading
+        grid keeps servicing every parameter change off-screen - reloading
         fields from the previous suite's directories on each slider tick, and
-        racing the live grid to write header_text.
+        racing the live grid to write the readout.
         """
         self._torn_down = True
+
         for stream in (self._field_stream, self._diff_stream,
                        *self._pointer_streams):
             try:
@@ -301,8 +322,57 @@ class PlotGrid(param.Parameterized):
             min_width=MIN_PANEL_WIDTH,
         )
 
-    def _element(self, da, meta, title):
-        """Wrap a loaded field as the appropriate HoloViews element."""
+    def _panel_opts(self, title, cmap):
+        """Every option that defines a panel's STRUCTURE.
+
+        _element and _placeholder must both go through here, and the result
+        must not differ between them beyond title and colormap. HoloViews
+        builds a subplot's structure from the FIRST element its DynamicMap
+        yields and only swaps the data thereafter - it does not add a
+        colorbar that was not there, or attach tools that were not there.
+
+        That is precisely what broke the difference panels: on first render
+        no pair is selected, so their DynamicMaps yielded a placeholder, and
+        the placeholder set colorbar=False and tools=[]. The panels then
+        stayed colorbar-less and un-navigable even once real difference data
+        arrived, while the field panels - which yield a real element first -
+        were fine.
+
+        default_tools=[] is load-bearing too. HoloViews PREPENDS its own set
+        (pan, wheel_zoom, box_zoom, save, reset, help) and `tools` only ADDS
+        to it, so without this the plot gets a second wheel_zoom alongside
+        ours and box_zoom reappears despite never being asked for.
+
+        Note there is no `toolbar` key: toolbar is a Layout-level option in
+        HoloViews. Setting it on an element does not suppress the strip and
+        does interfere with tool activation. See layout().
+        """
+        return dict(
+            title=title,
+            cmap=cmap,
+            colorbar=True,
+            colorbar_opts={"width": COLORBAR_WIDTH},
+            default_tools=[],
+            tools=["pan", "wheel_zoom", "reset"],
+            active_tools=["pan", "wheel_zoom"],
+            # framewise=False is what makes zoom survive a time-slider tick:
+            # the axis ranges are not recomputed when the data changes.
+            framewise=False,
+            shared_axes=True,
+            xlabel="longitude",
+            ylabel="latitude",
+            **self._responsive_opts(),
+        )
+
+    def _element(self, da, meta, title, cmap=DEFAULT_CMAP):
+        """Wrap a loaded field as the appropriate HoloViews element.
+
+        The field panels' colormap comes from the .apply.opts() chain in
+        layout() as a param reference, so the cmap passed here is only a
+        structural placeholder for them. The difference panels pass
+        DIFF_CMAP explicitly, because a static value in that chain alongside
+        param references makes HoloViews rebuild the branch differently.
+        """
         lon = da[meta.lon_dim].values
         lat = da[meta.lat_dim].values
         self._last_extent = (
@@ -313,49 +383,68 @@ class PlotGrid(param.Parameterized):
         # hv.Image assumes an evenly spaced grid and will silently misplace
         # data on, say, a reduced Gaussian latitude axis. QuadMesh handles
         # irregular spacing correctly, at some rendering cost.
+        #
+        # kdims come from meta, which earth2StudioPlot has already
+        # canonicalized to latitude/longitude regardless of what a given
+        # model called them on disk.
         cls = hv.Image if meta.regular_grid else hv.QuadMesh
 
-        # kdims come from meta, which earth2StudioPlot has already
-        # canonicalized — this is what lets shared_axes connect panels loaded
-        # from models that name their dimensions differently on disk.
-        #
-        # No "hover" in tools: the readout above the grid replaces it, and
-        # having both means two things reporting the same number in two
-        # places, which invites them to disagree.
         return cls(da, kdims=[meta.lon_dim, meta.lat_dim]).opts(
-            title=title,
-            colorbar=True,
-            colorbar_opts={"width": COLORBAR_WIDTH},
-            active_tools=["box_zoom"],
-            # framewise=False is what makes zoom survive a time-slider tick:
-            # the axis ranges are not recomputed when the data changes.
-            framewise=False,
-            shared_axes=True,
-            xlabel="longitude",
-            ylabel="latitude",
-            **self._responsive_opts(),
-        )
+            **self._panel_opts(title, cmap))
 
     def _placeholder(self, title):
-        """Blank panel that preserves grid geometry and axis ranges.
+        """Blank panel that preserves grid geometry, axis ranges, and plot
+        structure - see _panel_opts on why the third of those matters.
 
-        Zeros rather than NaN: NaN renders transparent, which would leave the
-        panel visually empty rather than showing a grey block.
+        The kdims are NOT optional and NOT cosmetic. shared_axes links
+        panels by DIMENSION NAME, so a placeholder built from a bare array
+        gets HoloViews' default x/y names and lands in a different group
+        from the real panels on longitude/latitude. That is what split the
+        grid into two pairs: fields together, placeholders together.
+
+        NaN rather than zeros: a placeholder carries a real colormap (it has
+        to, for the structure to match), and zeros would render as a solid
+        block of that colormap's low end. NaN renders transparent, which
+        reads as empty.
         """
         left, bottom, right, top = self._last_extent
         return hv.Image(
-            np.zeros((2, 2)), bounds=(left, bottom, right, top)
-        ).opts(
-            title=title,
-            cmap=["#f0f0f0"],
-            colorbar=False,
-            framewise=False,
-            shared_axes=True,
-            xlabel="longitude",
-            ylabel="latitude",
-            toolbar=None,
-            **self._responsive_opts(),
-        )
+            np.full((2, 2), np.nan), bounds=(left, bottom, right, top),
+            kdims=[CANON_LON, CANON_LAT]
+        ).opts(**self._panel_opts(title, PLACEHOLDER_CMAP))
+
+    def dump_ranges(self, *_):
+        """Print which panels share axis ranges, grouped by title.
+
+        Two standalone repros failed to reproduce the pairwise split, so
+        this reads it out of the live app instead. The grouping tells us
+        what the split follows: rows (field with its own diff), columns
+        (fields together, diffs together), or something else.
+        """
+        pane = self._hv_pane
+        if pane is None:
+            print("dump_ranges: no pane", flush=True)
+            return
+        try:
+            from bokeh.models import Plot
+        except ImportError:
+            return
+        root = pane.get_root()
+        if root is None:
+            print("dump_ranges: no root", flush=True)
+            return
+        try:
+            figs = list(root.select({"type": Plot}))
+            groups = {}
+            for f in figs:
+                title = getattr(getattr(f, "title", None), "text", "?")
+                groups.setdefault(f.x_range.id, []).append(title)
+            print(f"dump_ranges: {len(figs)} figs, "
+                  f"{len(groups)} distinct x_ranges", flush=True)
+            for rid, titles in groups.items():
+                print(f"  {rid}: {titles}", flush=True)
+        except Exception:
+            traceback.print_exc()
 
     # -- callbacks ------------------------------------------------------
 
@@ -377,14 +466,14 @@ class PlotGrid(param.Parameterized):
             traceback.print_exc()
             with self._fields_lock:
                 self._fields.pop(("field", model), None)
-            return self._placeholder(f"{model} — {type(exc).__name__}: {exc}")
+            return self._placeholder(f"{model} - {type(exc).__name__}: {exc}")
 
         with self._fields_lock:
             self._fields[("field", model)] = (da, meta)
 
         if is_first:
-            # One panel is nominated to publish the shared valid-time header,
-            # avoiding an extra read purely to populate it.
+            # One panel is nominated to publish the shared valid-time
+            # header, avoiding an extra read purely to populate it.
             label = meta.time_label()
             if label != self.state.header_text:
                 _schedule(partial(setattr, self.state, "header_text", label))
@@ -399,13 +488,13 @@ class PlotGrid(param.Parameterized):
         if not other:
             with self._fields_lock:
                 self._fields.pop(("diff", model), None)
-            return self._placeholder(f"{model} — no difference selected")
+            return self._placeholder(f"{model} - no difference selected")
 
         status = self.state.diff_status.get(model, "")
         if status == "computing":
-            return self._placeholder(f"{model} minus {other} — computing…")
+            return self._placeholder(f"{model} minus {other} - computing...")
         if status.startswith("error"):
-            return self._placeholder(f"{model} minus {other} — {status}")
+            return self._placeholder(f"{model} minus {other} - {status}")
 
         try:
             da, meta = load_diff_field(
@@ -423,12 +512,13 @@ class PlotGrid(param.Parameterized):
             with self._fields_lock:
                 self._fields.pop(("diff", model), None)
             return self._placeholder(
-                f"{model} minus {other} — {type(exc).__name__}: {exc}")
+                f"{model} minus {other} - {type(exc).__name__}: {exc}")
 
         with self._fields_lock:
             self._fields[("diff", model)] = (da, meta)
 
-        return self._element(da, meta, title=f"{model} minus {other}")
+        return self._element(da, meta, title=f"{model} minus {other}",
+                             cmap=DIFF_CMAP)
 
     # -- cursor readout --------------------------------------------------
 
@@ -445,7 +535,7 @@ class PlotGrid(param.Parameterized):
     def _on_pointer(self, kind, x=None, y=None):
         """Update the readout from a cursor position over a panel.
 
-        `kind` is "field" or "diff", carried in by the per-panel partial —
+        `kind` is "field" or "diff", carried in by the per-panel partial -
         it decides whether the readout reports model values or differences,
         so hovering a diff panel shows deltas rather than absolute values.
 
@@ -471,7 +561,7 @@ class PlotGrid(param.Parameterized):
                 continue
             da, meta = entry
             var_name = var_name or meta.var_name
-            rows.append((model, self._sample(da, meta, x, y)))
+            rows.append((model, _fmt(self._sample(da, meta, x, y))))
 
         if not rows:
             return
@@ -479,7 +569,7 @@ class PlotGrid(param.Parameterized):
         label = f"{var_name} delta" if kind == "diff" else var_name
         self.state.readout_rows = (
             (("Variable", label), ("Lat", f"{y:.2f}"), ("Lon", f"{x:.2f}")),
-            tuple((m, _fmt(v)) for m, v in rows),
+            tuple(rows),
         )
 
     @staticmethod
@@ -488,7 +578,7 @@ class PlotGrid(param.Parameterized):
 
         Alignment is the whole point. A plain inline run of spans reflows on
         every mouse move, because "0.0005791" and "-0.006" are different
-        widths — so the labels visibly slide around and the readout is
+        widths - so the labels visibly slide around and the readout is
         unreadable while the cursor moves. Two things fix that: a CSS grid
         with `max-content` label columns (label positions are set by the
         widest label once and then never move), and right-aligned values in
@@ -513,30 +603,32 @@ class PlotGrid(param.Parameterized):
             "<style>"
             ".readout-wrap{display:flex;align-items:flex-start;gap:32px;}"
             ".readout{display:grid;"
+            # max-content sizes each label column to its widest member and
+            # holds it; the fixed value columns mean a value gaining a digit
+            # cannot push the next label sideways.
             "grid-template-columns:max-content 4.5em max-content 7em;"
             "column-gap:10px;row-gap:1px;font-size:13px;"
             "width:max-content;}"
-            # text-align must be explicit on BOTH classes. Without it the
+            # text-align must be explicit on BOTH classes: without it the
             # cells inherit whatever alignment the surrounding Panel card
-            # applies, which is why the labels came out right-aligned
-            # against each other. justify-self pins the grid item to its
-            # column edge; text-align positions the text inside that item.
+            # applies, which right-aligns the labels against each other.
             ".readout .rl{font-weight:600;text-align:left;justify-self:start;}"
             ".readout .rv{text-align:right;justify-self:stretch;"
-            "font-variant-numeric:tabular-nums;"
-            # nowrap is the important part: a scientific-notation value like
-            # -3.443e-05 is wider than the column, and without this it wraps
-            # to a second line, which grows the whole grid and pushes every
-            # row below it down. Overflowing left is harmless here since the
-            # column to the left is the label's, which has slack.
-            "white-space:nowrap;"
+            # nowrap matters for the exponent cases that survive _fmt: a
+            # value wider than its column would wrap to a second line and
+            # push every row below it down.
+            "white-space:nowrap;font-variant-numeric:tabular-nums;"
             "font-family:ui-monospace,SFMono-Regular,Menlo,monospace;}"
             ".readout-time{font-size:13px;font-weight:600;white-space:nowrap;"
             "font-variant-numeric:tabular-nums;}"
+            ".readout-hint{font-size:11px;color:#666;white-space:nowrap;"
+            "align-self:flex-end;}"
             "</style>"
             "<div class='readout-wrap'>"
             f"<div class='readout-time'>{stamp}</div>"
             f"<div class='readout'>{''.join(cells)}</div>"
+            "<div class='readout-hint'>scroll to zoom &middot; "
+            "drag to pan &middot; double-click to reset</div>"
             "</div>"
         )
 
@@ -557,19 +649,23 @@ class PlotGrid(param.Parameterized):
                 streams=[self._diff_stream])
 
             # rasterize() must wrap the DynamicMap rather than being called
-            # inside the callback — it is itself a dynamic operation and
+            # inside the callback - it is itself a dynamic operation and
             # cannot be returned from one.
             #
             # Styling is applied downstream of rasterize via .apply.opts with
             # param references, so changing the colormap or colour limits
             # restyles the existing render instead of re-reading the field.
+            #
+            # The diff branch carries only clim here. Its colormap is set on
+            # the element instead: mixing a static value with param
+            # references in this chain makes HoloViews rebuild the branch in
+            # a way that drops the element-level opts.
             field = rasterize(field, precompute=True).apply.opts(
                 clim=self.state.param.field_clim,
                 cmap=self.state.param.cmap,
             )
             diff = rasterize(diff, precompute=True).apply.opts(
                 clim=self.state.param.diff_clim,
-                cmap=DIFF_CMAP,
             )
 
             # One PointerXY per panel, sourced from the object that actually
@@ -582,14 +678,24 @@ class PlotGrid(param.Parameterized):
 
             panels += [field, diff]
 
-        # sizing_mode here is the third of the three places responsive
-        # sizing has to be declared: hv.Layout renders as a Bokeh gridplot,
-        # and a gridplot does not propagate responsive sizing to its
-        # children on its own.
+        # toolbar=None removes the button STRIP, not the tools. Pan,
+        # wheel-zoom and reset stay attached and active with no UI to turn
+        # them off - which is the point: all three are always on, so the
+        # buttons were only an opportunity to break navigation by accident.
+        #
+        # This has to be here rather than in _panel_opts: toolbar is a
+        # Layout-level option, and setting it on an element neither
+        # suppresses the strip nor leaves tool activation alone.
+        #
+        # shared_axes is what links the panels. It links them PAIRWISE, not
+        # all-to-all - see the module docstring.
+        #
+        # sizing_mode is the third of three places responsive sizing has to
+        # be declared: hv.Layout renders as a Bokeh gridplot, and a gridplot
+        # does not propagate responsive sizing to its children on its own.
         self._layout = hv.Layout(panels).cols(2).opts(
             shared_axes=True,
-            merge_tools=True,
-            toolbar="above",
+            toolbar=None,
             sizing_mode="stretch_width",
         )
         return self._layout
@@ -600,16 +706,23 @@ class PlotGrid(param.Parameterized):
         # refreshes the time even though the cursor hasn't moved, and a
         # cursor move refreshes the values without dropping the time. Before
         # the cursor first enters a panel, readout_rows is empty and this
-        # renders the timestamp alone.
+        # renders the timestamp and the navigation hint alone.
         readout = pn.pane.HTML(
-            pn.bind(self._readout_html,
+            pn.bind(lambda stamp, rows: self._readout_html(
+                        stamp, rows[0], rows[1]),
                     self.state.param.header_text,
-                    self.state.param.readout_rows.rx()[0],
-                    self.state.param.readout_rows.rx()[1]),
+                    self.state.param.readout_rows),
             margin=(4, 0, 8, 12),
+            # Reserves the readout's rows so the plots below don't shift
+            # down the first time the cursor enters a panel.
             min_height=64,
             sizing_mode="stretch_width",
         )
+
+        try:
+            pn.state.onload(self.dump_ranges)
+        except Exception:
+            pass
 
         self._hv_pane = pn.pane.HoloViews(
             self.layout(), sizing_mode="stretch_width")
@@ -674,7 +787,7 @@ class PlotGrid(param.Parameterized):
 
         Diffing two full forecast suites takes long enough that doing it
         inside the DynamicMap callback would block the Bokeh server thread
-        and freeze the whole app — including the panels that have nothing to
+        and freeze the whole app - including the panels that have nothing to
         do with this pair. The callback only ever reads an already-computed
         file; this does the work and flips diff_status when it lands.
         """
@@ -790,7 +903,7 @@ class PlotGrid(param.Parameterized):
         """Record the forecast length and clamp the current index into it.
 
         Named for what it used to do. It no longer touches
-        param.time_index.bounds — partly because those bounds are gone (see
+        param.time_index.bounds - partly because those bounds are gone (see
         PlotGridState.time_index), and partly because the old
         `self.state.param.time_index.bounds = ...` reached the CLASS-level
         Parameter object rather than this instance's.
@@ -803,7 +916,7 @@ class PlotGrid(param.Parameterized):
         """What the video exporter needs to render frames itself.
 
         The grid is Bokeh-rendered client-side, so there is no server-side
-        image to capture — the exporter reconstructs each frame through
+        image to capture - the exporter reconstructs each frame through
         earth2StudioPlot.plot_e2s_field instead. Panels are returned in
         display order; each entry feeds
         plot_e2s_field(dir, variable, level, t, cmap=cmap,

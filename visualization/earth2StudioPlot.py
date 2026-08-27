@@ -220,11 +220,19 @@ def load_e2s_field(model_dir, base_or_var, level, t):
     if PRES_NAME in da.dims and level is not None:
         da = da.sel({PRES_NAME: level}, method="nearest")
 
-    # Capture the init/cycle time (if present) before it potentially gets
-    # squeezed out below as a singleton dim — needed to compute the actual
-    # valid time for the title even though this size-1 axis isn't the one
-    # selected by `t`.
-    init_time = ds["time"].values[0] if "time" in ds.coords else None
+    # Capture the initialization time, needed to turn a lead-time offset
+    # into an absolute valid time.
+    #
+    # Post-cf_convert this lives in forecast_reference_time, because `time`
+    # now holds the VALID times rather than a size-1 initialization axis.
+    # The `time`-based fallback is for pre-conversion files, which still use
+    # earth2studio's original layout.
+    if "forecast_reference_time" in ds.coords:
+        init_time = ds["forecast_reference_time"].values
+    elif "time" in ds.coords and ds["time"].size == 1:
+        init_time = ds["time"].values[0]
+    else:
+        init_time = None
 
     # Don't rely on the axis actually being named "time" — earth2studio
     # outputs may call it lead_time/step/forecast_time/etc., and there can be
@@ -277,6 +285,15 @@ def load_e2s_field(model_dir, base_or_var, level, t):
     # otherwise surface them as extra dimensions and, worse, rasterize can
     # choke trying to aggregate over a length-1 dim it didn't expect.
     da = da.reset_coords(drop=True)
+
+    # forecast_period rides along on the time axis as an auxiliary
+    # coordinate, so selecting a step leaves it behind as a scalar coord.
+    # reset_coords should have taken it, but HoloViews surfaces stray
+    # scalar coords as phantom dimensions and rasterize then fails trying
+    # to aggregate over them, so this is worth being explicit about.
+    for stray in ("forecast_period", "forecast_reference_time"):
+        if stray in da.coords:
+            da = da.drop_vars(stray)
 
     # Most of these models write latitude north-to-south. pcolormesh doesn't
     # care, but hv.Image with a descending y axis renders inverted and
