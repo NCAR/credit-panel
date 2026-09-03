@@ -7,6 +7,7 @@ import time
 import signal
 
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 
 from inference.outputParams import OutputParams
@@ -16,8 +17,72 @@ from inference.commandRunner import CommandRunner
 from inference.milesCreditRunner import MilesCreditRunner
 from inference.earth2StudioRunner import Earth2StudioRunner
 
-MILES_CREDIT_MODELS = {'WXFormer'}
-EARTH2STUDIO_MODELS = {'AIFS', 'Aurora', 'Pangu'}
+MILES_CREDIT_MODEL_LIST = ['WXFormer']
+MILES_CREDIT_MODELS = frozenset(MILES_CREDIT_MODEL_LIST)
+EARTH2STUDIO_MODEL_LIST = ['AIFS', 'Aurora', 'Pangu', 'FourCastNet3']
+EARTH2STUDIO_MODELS = frozenset(EARTH2STUDIO_MODEL_LIST)
+#EARTH2STUDIO_MODELS = {'AIFS', 'Aurora', 'Pangu', 'FourCastNet3', 'GraphCast', 'SFNO'}
+
+# Short, hover-friendly descriptions shown as a tooltip on each model button.
+MODEL_DESCRIPTIONS = {
+    'WXFormer': (
+        "NCAR MILES-CREDIT's own transformer-based weather model. Writes "
+        "ERA5-style output with a real vertical-level dimension."
+    ),
+    'AIFS': (
+        "ECMWF's AI Forecasting System, run through Earth2Studio (PyTorch). "
+        "Requires a source-compiled flash_attn."
+    ),
+    'Aurora': (
+        "Microsoft's Aurora foundation model for weather forecasting, run "
+        "through Earth2Studio (PyTorch)."
+    ),
+    'Pangu': (
+        "Huawei's Pangu-Weather model, run through Earth2Studio on "
+        "GPU-enabled ONNX Runtime. Fast, and a reasonable baseline."
+    ),
+    'FourCastNet3': (
+        "NVIDIA's FourCastNet 3, a spherical Fourier Neural Operator model, "
+        "run through Earth2Studio (PyTorch + makani)."
+    ),
+}
+
+
+class ModelPicker(param.Parameterized):
+    """Multi-select button group where each button shows a hover tooltip
+    describing the model it selects."""
+
+    value = param.List(default=[])
+
+    def __init__(self, options, descriptions=None, **params):
+        super().__init__(**params)
+        descriptions = descriptions or {}
+        self._buttons = {}
+        for name in options:
+            button = pn.widgets.Button(
+                name=name,
+                button_type='primary',
+                button_style='solid' if name in self.value else 'outline',
+                description=descriptions.get(name, ''),
+                margin=(0, 5, 5, 0),
+            )
+            button.on_click(partial(self._on_click, name))
+            self._buttons[name] = button
+        self.row = pn.Row(*self._buttons.values(), margin=(0, 5, 5, 0))
+
+    def _on_click(self, name, event):
+        selected = set(self.value)
+        if name in selected:
+            selected.discard(name)
+            self._buttons[name].button_style = 'outline'
+        else:
+            selected.add(name)
+            self._buttons[name].button_style = 'solid'
+        # Preserve the original option ordering rather than click order.
+        self.value = [m for m in self._buttons if m in selected]
+
+    def panel(self):
+        return self.row
 
 
 class InferenceTab(param.Parameterized):
@@ -28,13 +93,10 @@ class InferenceTab(param.Parameterized):
     def __init__(self, **params):
         super().__init__(**params)
 
-        self.modelPicker = pn.widgets.CheckButtonGroup(
-            name="Select Model",
+        self.modelPicker = ModelPicker(
             value=['AIFS', 'Aurora'],
-            options=['WXFormer', 'AIFS', 'Aurora', 'Pangu'],
-            button_type='primary',
-            button_style='outline',
-            margin=(0, 5, 5, 0)
+            options=MILES_CREDIT_MODEL_LIST + EARTH2STUDIO_MODEL_LIST,
+            descriptions=MODEL_DESCRIPTIONS,
         )
 
         self.outputParams = OutputParams(start_path=Path(f"/glade/derecho/scratch/{os.environ['USER']}"))
@@ -437,7 +499,7 @@ class InferenceTab(param.Parameterized):
         return pn.Column(
             pn.WidgetBox(
                 '# AI Model',
-                self.modelPicker,
+                self.modelPicker.panel(),
                 sizing_mode='stretch_width',
             ),
             self.outputParams.panel(),
